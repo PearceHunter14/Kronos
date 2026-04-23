@@ -21,12 +21,14 @@ sys.path.insert(0, str(Path.home() / "Kronos"))
 import argparse
 import os
 import smtplib
+from datetime import timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import ccxt
 import numpy as np
 import pandas as pd
+import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -119,7 +121,8 @@ def hourly_vol(closes, period=20):
 def kronos_paths(df_1h, predictor):
     x_df = df_1h.iloc[:LOOKBACK_1H][["open","high","low","close","volume","amount"]]
     x_ts = df_1h.iloc[:LOOKBACK_1H]["timestamps"]
-    y_ts = pd.date_range(x_ts.iloc[-1], periods=PRED_LEN+1, freq="1h")[1:]
+    # Must be pd.Series not DatetimeIndex — Kronos calls .dt on it
+    y_ts = pd.Series(pd.date_range(x_ts.iloc[-1], periods=PRED_LEN+1, freq="1h")[1:])
     paths = []
     for _ in range(SAMPLE_COUNT):
         pred = predictor.predict(
@@ -128,6 +131,69 @@ def kronos_paths(df_1h, predictor):
         )
         paths.append(pred["close"].values)
     return np.array(paths)
+
+
+# ── Market context (fetched once per cycle, shared across all assets) ──────────
+
+def fetch_fear_greed():
+    """
+    Alternative.me Fear & Greed Index (0=extreme fear, 100=extreme greed).
+    Contrarian signal: extreme fear → good time to buy, extreme greed → caution.
+    Returns (value: int, label: str, pts: int)
+    """
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        data  = r.json()["data"][0]
+        value = int(data["value"])
+        label = data["value_classification"]
+        if value <= 25:
+            pts = 12    # extreme fear = historically good entry
+        elif value <= 45:
+            pts = 6
+        elif value <= 55:
+            pts = 0
+        elif value <= 75:
+            pts = -6
+        else:
+            pts = -12   # extreme greed = historically bad entry
+        return value, label, pts
+    except Exception:
+        return 50, "Unknown", 0
+
+
+def fetch_funding_rates():
+    """
+    BTC perpetual funding rate from Bybit (no API key needed).
+    Positive rate = longs pay shorts (crowded/overleveraged longs → bearish lean).
+    Negative rate = shorts pay longs (crowded shorts → potential squeeze, bullish lean).
+    Returns dict: asset → (rate: float, pts: int)
+    """
+    # Map our spot assets to Bybit perp symbols
+    perp_map = {
+        "BTC/USD": "BTC/USDT:USDT",
+        "ETH/USD": "ETH/USDT:USDT",
+        "XRP/USD": "XRP/USDT:USDT",
+    }
+    results = {}
+    try:
+        bybit = ccxt.bybit({"enableRateLimit": True})
+        for spot, perp in perp_map.items():
+            info = bybit.fetch_funding_rate(perp)
+            rate = float(info["fundingRate"])
+            if rate < -0.0005:
+                pts = 10    # heavily shorted → squeeze potential
+            elif rate < 0:
+                pts = 5
+            elif rate < 0.0003:
+                pts = 0     # neutral
+            elif rate < 0.001:
+                pts = -5    # crowded longs
+            else:
+                pts = -10   # very crowded → danger
+            results[spot] = (rate, pts)
+    except Exception:
+        results = {a: (0.0, 0) for a in ASSETS}
+    return results
 
 # ── 10-Agent debate council ────────────────────────────────────────────────────
 #
@@ -327,7 +393,7 @@ COUNCIL = [
     RiskBear(), OverboughtBear(), VolatilityBear(), DoomBear(), ContraryBear(),
 ]
 
-def run_council(paths, df_1h, df_4h, price, holding):
+def run_council(paths, df_1h, df_4h, price, holding, fg_pts=0, funding_pts=0):
     results = []
     for agent in COUNCIL:
         try:
@@ -339,9 +405,15 @@ def run_council(paths, df_1h, df_4h, price, holding):
     buy_votes  = sum(1 for r in results if r["vote"] == "BUY")
     sell_votes = sum(1 for r in results if r["vote"] == "SELL")
 
-    if buy_votes >= BUY_VOTES_NEEDED and not holding:
+    # Fear/Greed and funding rate act as vote modifiers (not full agents)
+    # Combined bonus > +15 can tip a 7-vote situation to 8 (effectively)
+    context_score = fg_pts + funding_pts
+    effective_buy_votes  = buy_votes  + (1 if context_score >= 15 else 0)
+    effective_sell_votes = sell_votes + (1 if context_score <= -15 else 0)
+
+    if effective_buy_votes >= BUY_VOTES_NEEDED and not holding:
         verdict = "BUY"
-    elif sell_votes >= SELL_VOTES_NEEDED and holding:
+    elif effective_sell_votes >= SELL_VOTES_NEEDED and holding:
         verdict = "SELL"
     elif holding:
         verdict = "HOLD"
@@ -352,6 +424,7 @@ def run_council(paths, df_1h, df_4h, price, holding):
         "verdict": verdict,
         "buy_votes": buy_votes,
         "sell_votes": sell_votes,
+        "context_score": context_score,
         "agents": results,
     }
 
@@ -393,7 +466,7 @@ VERDICT_LABELS = {
     "WAIT": "· WAITING",
 }
 
-def print_dashboard(results, portfolio, prices, next_min):
+def print_dashboard(results, portfolio, prices, next_min, context=None):
     tv  = total_value(portfolio, prices)
     pnl = tv - portfolio["start_value"]
     dep = deployed_pct(portfolio, prices) * 100
@@ -413,6 +486,11 @@ def print_dashboard(results, portfolio, prices, next_min):
     filled = int(40 * tv / 5000)
     bar    = "█" * filled + "░" * (40 - filled)
     row(f"  [{bar}] {tv/5000*100:.1f}% to goal")
+    if context:
+        fg_v = context.get("fg_value", 50)
+        fg_l = context.get("fg_label", "?")
+        fg_p = context.get("fg_pts", 0)
+        row(f"  Fear & Greed: {fg_v}/100 — {fg_l}  ({fg_p:+d} pts context bonus)")
     row()
 
     for asset, res in results.items():
@@ -451,6 +529,10 @@ def print_dashboard(results, portfolio, prices, next_min):
             if len(prefix) + len(reason) > w - 2:
                 reason = reason[:w - 2 - len(prefix) - 3] + "..."
             row(f"{prefix}{reason}")
+
+        # Funding rate
+        fund_rate, fund_pts = res.get("funding", (0.0, 0))
+        row(f"  Funding rate: {fund_rate*100:+.4f}%  ({fund_pts:+d} pts context bonus)")
 
         # Open position
         if asset in portfolio["positions"]:
@@ -560,15 +642,27 @@ def run_cycle(predictor, portfolio):
         asset_data[asset] = (df_1h, df_4h)
     print("done.")
 
+    print(f"[{datetime.now().strftime('%H:%M')}] Fetching market context...", end=" ", flush=True)
+    fg_value, fg_label, fg_pts = fetch_fear_greed()
+    funding_rates = fetch_funding_rates()
+    print(f"F&G={fg_value} ({fg_label}), funding fetched.")
+
     print(f"[{datetime.now().strftime('%H:%M')}] Running Kronos + council ({SAMPLE_COUNT} paths × {len(ASSETS)} assets)...", end=" ", flush=True)
     results = {}
     for asset, (df_1h, df_4h) in asset_data.items():
-        price   = prices[asset]
-        holding = asset in portfolio["positions"]
-        paths   = kronos_paths(df_1h, predictor)
-        council = run_council(paths, df_1h, df_4h, price, holding)
-        results[asset] = {"council": council, "paths": paths, "df_1h": df_1h, "df_4h": df_4h}
+        price        = prices[asset]
+        holding      = asset in portfolio["positions"]
+        paths        = kronos_paths(df_1h, predictor)
+        fund_pts     = funding_rates.get(asset, (0.0, 0))[1]
+        council      = run_council(paths, df_1h, df_4h, price, holding, fg_pts, fund_pts)
+        results[asset] = {
+            "council": council, "paths": paths,
+            "df_1h": df_1h, "df_4h": df_4h,
+            "funding": funding_rates.get(asset, (0.0, 0)),
+        }
     print("done.")
+    # Store context for dashboard
+    results["_context"] = {"fg_value": fg_value, "fg_label": fg_label, "fg_pts": fg_pts}
 
     # Stop-loss checks
     for asset, pos in list(portfolio["positions"].items()):
@@ -581,10 +675,12 @@ def run_cycle(predictor, portfolio):
                 extra=f"P&L:    {pnl:+.1f}%",
             )
             df_1h, df_4h = asset_data[asset]
-            results[asset]["council"] = run_council(results[asset]["paths"], df_1h, df_4h, prices[asset], False)
+            fund_pts = results[asset]["funding"][1]
+            results[asset]["council"] = run_council(
+                results[asset]["paths"], df_1h, df_4h, prices[asset], False, fg_pts, fund_pts)
 
-    sells = [(a, r) for a, r in results.items() if r["council"]["verdict"] == "SELL"]
-    buys  = [(a, r) for a, r in results.items() if r["council"]["verdict"] == "BUY"]
+    sells = [(a, r) for a, r in results.items() if isinstance(r, dict) and r.get("council", {}).get("verdict") == "SELL"]
+    buys  = [(a, r) for a, r in results.items() if isinstance(r, dict) and r.get("council", {}).get("verdict") == "BUY"]
 
     for asset, res in sells:
         pnl = paper_sell(portfolio, asset, prices[asset], reason="council")
@@ -615,9 +711,12 @@ def run_cycle(predictor, portfolio):
     save_portfolio(portfolio)
 
     next_min = 60 - datetime.now().minute
-    # Strip raw data before display
-    display_results = {a: {"council": r["council"]} for a, r in results.items()}
-    print_dashboard(display_results, portfolio, prices, next_min)
+    context  = results.pop("_context", {})
+    display_results = {
+        a: {"council": r["council"], "funding": r.get("funding", (0, 0))}
+        for a, r in results.items() if isinstance(r, dict) and "council" in r
+    }
+    print_dashboard(display_results, portfolio, prices, next_min, context)
     return next_min
 
 def send_weekly_summary(portfolio):
@@ -730,15 +829,81 @@ Signal Agent — hunterpearce14@gmail.com
         print(f"[email] Failed: {e}")
 
 
+def run_backtest():
+    """
+    Technical-only backtest over last ~90 days of hourly data.
+    Skips Kronos (too slow for 100+ windows) — tests RSI/EMA/volume edge only.
+    """
+    print("Running backtest (technical signals only, ~90 days)...")
+    exchange = ccxt.kraken({"enableRateLimit": True})
+
+    for asset in ASSETS:
+        print(f"\n{'─'*50}\n{asset}")
+        raw   = exchange.fetch_ohlcv(asset, "1h", limit=2000)
+        df    = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+        closes = df["close"].values
+        vols   = df["volume"].values
+
+        trades, position = [], None
+
+        for i in range(300, len(df) - 1):
+            price    = closes[i]
+            rsi_val  = rsi(closes[max(0,i-60):i+1])
+            e20      = ema(closes[max(0,i-50):i+1], 20)
+            e50      = ema(closes[max(0,i-100):i+1], 50)
+            vr       = volume_ratio(vols[max(0,i-21):i+1])
+            trend_up = e20 > e50
+
+            # Entry: oversold + uptrend + volume
+            buy_sig  = rsi_val < 45 and trend_up and vr > 1.0
+            # Exit: overbought OR trend breaks
+            sell_sig = rsi_val > 65 or e20 < e50
+
+            if position is None and buy_sig:
+                position = {"entry": price, "idx": i}
+            elif position is not None and sell_sig:
+                pnl = (price / position["entry"] - 1) * 100
+                trades.append(pnl)
+                position = None
+
+        if not trades:
+            print("  No completed trades in window")
+            continue
+
+        wins     = [t for t in trades if t > 0]
+        losses   = [t for t in trades if t <= 0]
+        win_rate = len(wins) / len(trades) * 100
+        avg_win  = np.mean(wins)  if wins   else 0
+        avg_loss = np.mean(losses) if losses else 0
+        total    = sum(trades)
+        expectancy = (win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss)
+
+        print(f"  Trades:      {len(trades)}  ({len(wins)}W / {len(losses)}L)")
+        print(f"  Win rate:    {win_rate:.1f}%")
+        print(f"  Avg win:     {avg_win:+.2f}%")
+        print(f"  Avg loss:    {avg_loss:+.2f}%")
+        print(f"  Expectancy:  {expectancy:+.2f}% per trade")
+        print(f"  Total P&L:   {total:+.2f}%")
+        verdict = "✅ Positive edge" if expectancy > 0 else "❌ No edge detected"
+        print(f"  Verdict:     {verdict}")
+
+    print("\nNote: this tests technical signals only. Kronos + agent council may differ.")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once",    action="store_true", help="Run one cycle then exit")
-    parser.add_argument("--summary", action="store_true", help="Send weekly summary email then exit")
+    parser.add_argument("--once",     action="store_true", help="Run one cycle then exit")
+    parser.add_argument("--summary",  action="store_true", help="Send weekly summary email then exit")
+    parser.add_argument("--backtest", action="store_true", help="Run technical backtest then exit")
     args = parser.parse_args()
 
     if args.summary:
         portfolio = load_portfolio()
         send_weekly_summary(portfolio)
+        return
+
+    if args.backtest:
+        run_backtest()
         return
 
     predictor = load_kronos()
