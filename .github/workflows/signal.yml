@@ -47,3 +47,9 @@ jobs:
           git add portfolio.json
           git diff --staged --quiet || git commit -m "portfolio update $(date -u '+%Y-%m-%d %H:%M UTC') [skip ci]"
           git push
+          
+      - name: Send weekly summary (Mondays only)
+        if: github.event.schedule == '0 8 * * 1'
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python btc_signal.py --summary
