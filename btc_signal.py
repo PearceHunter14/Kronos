@@ -30,7 +30,7 @@ import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-ASSETS       = ["BTC/USDT", "ETH/USDT", "XRP/USDT"]
+ASSETS       = ["BTC/USD", "ETH/USD", "XRP/USD"]
 PORTFOLIO_FILE = Path(__file__).parent / "portfolio.json"
 
 LOOKBACK_1H  = 400
@@ -75,7 +75,7 @@ def deployed_pct(portfolio, prices):
 # ── Data ───────────────────────────────────────────────────────────────────────
 
 def fetch_candles(symbol, timeframe="1h", limit=450):
-    exchange = ccxt.binance({"enableRateLimit": True})
+    exchange = ccxt.kraken({"enableRateLimit": True})
     raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df  = pd.DataFrame(raw, columns=["timestamps","open","high","low","close","volume"])
     df["timestamps"] = pd.to_datetime(df["timestamps"], unit="ms")
@@ -620,10 +620,126 @@ def run_cycle(predictor, portfolio):
     print_dashboard(display_results, portfolio, prices, next_min)
     return next_min
 
+def send_weekly_summary(portfolio):
+    password = os.environ.get("EMAIL_PASSWORD", "")
+    if not password:
+        print("[email] No EMAIL_PASSWORD — skipping weekly summary")
+        return
+
+    # Fetch current prices for unrealised P&L
+    prices = {}
+    try:
+        exchange = ccxt.kraken({"enableRateLimit": True})
+        for asset in ASSETS:
+            ticker = exchange.fetch_ticker(asset)
+            prices[asset] = float(ticker["last"])
+    except Exception as e:
+        print(f"[email] Price fetch failed: {e}")
+        prices = {a: portfolio["positions"][a]["entry"]
+                  for a in portfolio["positions"]}
+
+    tv      = total_value(portfolio, prices)
+    pnl     = tv - portfolio["start_value"]
+    pnl_pct = pnl / portfolio["start_value"] * 100
+    dep     = deployed_pct(portfolio, prices) * 100
+
+    # Weekly trades (last 7 days)
+    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    week_trades = [t for t in portfolio["trades"] if t["time"] >= cutoff]
+    closed = [t for t in week_trades if t["type"] == "SELL"]
+
+    wins      = [t for t in closed if t.get("pnl_pct", 0) > 0]
+    losses    = [t for t in closed if t.get("pnl_pct", 0) <= 0]
+    win_rate  = len(wins) / len(closed) * 100 if closed else 0
+    best      = max(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
+    worst     = min(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
+
+    # Open positions
+    pos_lines = []
+    for asset, pos in portfolio["positions"].items():
+        price   = prices.get(asset, pos["entry"])
+        unreal  = (price / pos["entry"] - 1) * 100
+        val     = pos["qty"] * price
+        pos_lines.append(
+            f"  {asset:<12}  {pos['qty']:.6f}  entry ${pos['entry']:,.4f}  "
+            f"now ${price:,.4f}  ({unreal:+.1f}%)  value ${val:,.2f}"
+        )
+
+    # Trade history this week
+    trade_lines = []
+    for t in week_trades[-20:]:
+        if t["type"] == "SELL":
+            trade_lines.append(
+                f"  {t['time'][:16]}  SELL  {t['asset'].replace('/USDT',''):<5}  "
+                f"@ ${t['price']:,.4f}  P&L {t.get('pnl_pct', 0):+.1f}%  [{t.get('reason','')}]"
+            )
+        else:
+            trade_lines.append(
+                f"  {t['time'][:16]}  BUY   {t['asset'].replace('/USDT',''):<5}  "
+                f"@ ${t['price']:,.4f}  ${t.get('usd', 0):,.0f} deployed"
+            )
+
+    progress_bar_len = 30
+    filled = int(progress_bar_len * min(tv, 5000) / 5000)
+    bar    = "█" * filled + "░" * (progress_bar_len - filled)
+
+    body = f"""\
+📊 WEEKLY PORTFOLIO SUMMARY
+{'━' * 52}
+{datetime.now().strftime('%A, %d %B %Y')}
+
+PORTFOLIO VALUE
+  Total:     ${tv:,.2f}
+  P&L:       {pnl:+.2f} ({pnl_pct:+.1f}%)
+  Cash:      ${portfolio['usd']:,.2f}
+  Deployed:  {dep:.0f}%
+
+GOAL: $1,000 → $5,000
+  [{bar}] {tv/5000*100:.1f}%
+  ${tv:,.2f} of $5,000  (${5000-tv:,.2f} to go)
+
+{'━' * 52}
+OPEN POSITIONS ({len(portfolio['positions'])})
+{'  None' if not pos_lines else chr(10).join(pos_lines)}
+
+{'━' * 52}
+THIS WEEK'S TRADES ({len(week_trades)})
+  Closed:    {len(closed)}  |  Wins: {len(wins)}  |  Losses: {len(losses)}  |  Win rate: {win_rate:.0f}%
+  Best:      {f"{best['asset'].replace('/USDT','')} {best['pnl_pct']:+.1f}%" if best else 'N/A'}
+  Worst:     {f"{worst['asset'].replace('/USDT','')} {worst['pnl_pct']:+.1f}%" if worst else 'N/A'}
+
+{chr(10).join(trade_lines) if trade_lines else '  No trades this week'}
+
+{'━' * 52}
+Checks run every 2 hours. Signals require 8/10 agents to BUY, 7/10 to SELL.
+Signal Agent — hunterpearce14@gmail.com
+"""
+
+    msg = MIMEMultipart()
+    msg["Subject"] = f"📊 Weekly Summary — ${tv:,.2f} ({pnl_pct:+.1f}%) — {datetime.now().strftime('%d %b')}"
+    msg["From"]    = ALERT_EMAIL
+    msg["To"]      = ALERT_EMAIL
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(ALERT_EMAIL, password)
+            smtp.send_message(msg)
+        print(f"[email] Weekly summary sent to {ALERT_EMAIL}")
+    except Exception as e:
+        print(f"[email] Failed: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Run one cycle then exit (for GitHub Actions)")
+    parser.add_argument("--once",    action="store_true", help="Run one cycle then exit")
+    parser.add_argument("--summary", action="store_true", help="Send weekly summary email then exit")
     args = parser.parse_args()
+
+    if args.summary:
+        portfolio = load_portfolio()
+        send_weekly_summary(portfolio)
+        return
 
     predictor = load_kronos()
     portfolio = load_portfolio()
