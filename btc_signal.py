@@ -1,7 +1,16 @@
 """
-Multi-asset crypto signal agent — BTC, ETH, XRP
-10-agent debate council (5 bulls, 5 bears) must reach overwhelming majority
-before any trade fires. Kronos forecasting + technical confluence.
+Multi-asset crypto signal agent — BTC, ETH
+7-agent independent council: each uses a genuinely different data source.
+5/7 votes required to BUY, 4/7 to SELL.
+
+Agents:
+  1. KronosAgent          — ML forecast: conviction + R/R + tail risk
+  2. PositioningAgent     — Futures L/S ratio + funding rate (crowding)
+  3. MarketStructureAgent — OI change vs price divergence
+  4. MacroRegimeAgent     — CoinGecko total market cap + BTC dominance
+  5. OrderFlowAgent       — Real-time order book bid/ask imbalance
+  6. SentimentAgent       — Fear & Greed index (contrarian)
+  7. MultiTimeframeAgent  — 1h + 4h price structure confluence
 
 Run:
     source ~/Kronos/.venv/bin/activate
@@ -32,16 +41,16 @@ import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-ASSETS       = ["BTC/USD", "ETH/USD", "XRP/USD"]
+ASSETS         = ["BTC/USD", "ETH/USD"]
 PORTFOLIO_FILE = Path(__file__).parent / "portfolio.json"
 
 LOOKBACK_1H  = 400
 LOOKBACK_4H  = 200
 PRED_LEN     = 12
-SAMPLE_COUNT = 10    # Kronos paths per asset (raise to 20 for more accuracy)
+SAMPLE_COUNT = 10    # Kronos paths per asset
 
-BUY_VOTES_NEEDED  = 8   # out of 10 agents
-SELL_VOTES_NEEDED = 7   # slightly easier to exit
+BUY_VOTES_NEEDED  = 5   # out of 7 (~71%)
+SELL_VOTES_NEEDED = 4   # out of 7 (~57%)
 
 MIN_MOVE     = 0.004
 SIZE_LOW     = 0.15
@@ -111,7 +120,6 @@ def volume_ratio(volumes, period=20):
     return float(v[-1] / avg) if avg > 0 else 1.0
 
 def hourly_vol(closes, period=20):
-    """Annualised volatility from recent 1h returns."""
     c = np.array(closes[-period-1:], dtype=float)
     r = np.diff(np.log(c))
     return float(r.std() * np.sqrt(8760))
@@ -132,288 +140,389 @@ def kronos_paths(df_1h, predictor):
         paths.append(pred["close"].values)
     return np.array(paths)
 
-
 # ── Market context (fetched once per cycle, shared across all assets) ──────────
 
 def fetch_fear_greed():
     """
     Alternative.me Fear & Greed Index (0=extreme fear, 100=extreme greed).
-    Contrarian signal: extreme fear → good time to buy, extreme greed → caution.
-    Returns (value: int, label: str, pts: int)
+    Returns (value: int, label: str)
     """
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        data  = r.json()["data"][0]
-        value = int(data["value"])
-        label = data["value_classification"]
-        if value <= 25:
-            pts = 12    # extreme fear = historically good entry
-        elif value <= 45:
-            pts = 6
-        elif value <= 55:
-            pts = 0
-        elif value <= 75:
-            pts = -6
-        else:
-            pts = -12   # extreme greed = historically bad entry
-        return value, label, pts
+        r    = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        data = r.json()["data"][0]
+        return int(data["value"]), data["value_classification"]
     except Exception:
-        return 50, "Unknown", 0
+        return 50, "Unknown"
 
 
 def fetch_funding_rates():
     """
-    BTC perpetual funding rate from Bybit (no API key needed).
-    Positive rate = longs pay shorts (crowded/overleveraged longs → bearish lean).
-    Negative rate = shorts pay longs (crowded shorts → potential squeeze, bullish lean).
-    Returns dict: asset → (rate: float, pts: int)
+    BTC/ETH perpetual funding rate from Bybit.
+    Returns dict: asset → (rate: float)
     """
-    # Map our spot assets to Bybit perp symbols
     perp_map = {
         "BTC/USD": "BTC/USDT:USDT",
         "ETH/USD": "ETH/USDT:USDT",
-        "XRP/USD": "XRP/USDT:USDT",
     }
     results = {}
     try:
         bybit = ccxt.bybit({"enableRateLimit": True})
         for spot, perp in perp_map.items():
             info = bybit.fetch_funding_rate(perp)
-            rate = float(info["fundingRate"])
-            if rate < -0.0005:
-                pts = 10    # heavily shorted → squeeze potential
-            elif rate < 0:
-                pts = 5
-            elif rate < 0.0003:
-                pts = 0     # neutral
-            elif rate < 0.001:
-                pts = -5    # crowded longs
-            else:
-                pts = -10   # very crowded → danger
-            results[spot] = (rate, pts)
+            results[spot] = float(info["fundingRate"])
     except Exception:
-        results = {a: (0.0, 0) for a in ASSETS}
+        results = {a: 0.0 for a in ASSETS}
     return results
 
-# ── 10-Agent debate council ────────────────────────────────────────────────────
+
+def fetch_onchain(asset):
+    """
+    Open interest change (24h) and long/short ratio from Bybit public API.
+    Returns dict: oi_change_24h, long_ratio, oi_usd
+    """
+    perp_map = {"BTC/USD": ("BTC/USDT:USDT", "BTCUSDT"),
+                "ETH/USD": ("ETH/USDT:USDT", "ETHUSDT")}
+    perp, sym = perp_map.get(asset, ("BTC/USDT:USDT", "BTCUSDT"))
+    out = {"oi_change_24h": 0.0, "long_ratio": 0.5, "oi_usd": 0.0}
+
+    try:
+        bybit   = ccxt.bybit({"enableRateLimit": True})
+        oi_hist = bybit.fetch_open_interest_history(perp, "1h", limit=25)
+        if len(oi_hist) >= 2:
+            oi_now = float(oi_hist[-1].get("openInterestAmount", 0))
+            oi_24h = float(oi_hist[0].get("openInterestAmount", oi_now))
+            out["oi_usd"]        = oi_now
+            out["oi_change_24h"] = (oi_now / oi_24h - 1) if oi_24h > 0 else 0
+    except Exception:
+        pass
+
+    try:
+        r    = requests.get("https://api.bybit.com/v5/market/account-ratio",
+                            params={"category": "linear", "symbol": sym,
+                                    "period": "1h", "limit": 1}, timeout=10)
+        data = r.json()
+        if data.get("retCode") == 0:
+            lst = data["result"]["list"]
+            if lst:
+                out["long_ratio"] = float(lst[0]["buyRatio"])
+    except Exception:
+        pass
+
+    return out
+
+
+def fetch_macro():
+    """CoinGecko global market: total cap 24h change + BTC dominance."""
+    try:
+        r    = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
+        data = r.json()["data"]
+        return {
+            "btc_dominance": data["market_cap_percentage"].get("btc", 50.0),
+            "cap_chg_24h":   data["market_cap_change_percentage_24h_usd"],
+        }
+    except Exception:
+        return {"btc_dominance": 50.0, "cap_chg_24h": 0.0}
+
+
+def fetch_orderbook(asset):
+    """Bybit perp order book — top-25 bid/ask volume imbalance."""
+    perp_map = {"BTC/USD": "BTC/USDT:USDT", "ETH/USD": "ETH/USDT:USDT"}
+    perp = perp_map.get(asset, "BTC/USDT:USDT")
+    try:
+        bybit = ccxt.bybit({"enableRateLimit": True})
+        ob    = bybit.fetch_order_book(perp, limit=25)
+        bid   = sum(b[1] for b in ob["bids"])
+        ask   = sum(a[1] for a in ob["asks"])
+        imb   = bid / (bid + ask) if (bid + ask) > 0 else 0.5
+        return {"imbalance": imb, "bid_vol": bid, "ask_vol": ask}
+    except Exception:
+        return {"imbalance": 0.5, "bid_vol": 0, "ask_vol": 0}
+
+
+# ── 7-Agent independent council ────────────────────────────────────────────────
 #
-# Each agent returns {"vote": "BUY"|"SELL"|"HOLD", "reason": str}
-# 5 bulls have low bars to BUY, high bars to SELL.
-# 5 bears have low bars to SELL, high bars to BUY.
-# A trade fires only when enough agents across both camps agree.
+# Each agent receives a unified context dict (ctx) and returns:
+#   {"vote": "BUY"|"SELL"|"HOLD", "reason": str}
+#
+# Data sources are non-overlapping:
+#   KronosAgent          → ML model paths
+#   PositioningAgent     → L/S ratio + funding rate
+#   MarketStructureAgent → OI change vs price direction
+#   MacroRegimeAgent     → CoinGecko global market cap
+#   OrderFlowAgent       → Order book bid/ask ratio
+#   SentimentAgent       → Fear & Greed index
+#   MultiTimeframeAgent  → 1h + 4h price structure
 
 class Agent:
-    def __init__(self, name, bias):
+    def __init__(self, name):
         self.name = name
-        self.bias = bias  # "bull" or "bear"
 
-    def analyze(self, paths, df_1h, df_4h, price, holding):
+    def analyze(self, ctx):
         raise NotImplementedError
 
 
-# ── Bull agents ────────────────────────────────────────────────────────────────
+class KronosAgent(Agent):
+    """
+    ML forecast combines conviction (% profitable paths), reward/risk ratio,
+    and tail risk (worst-20% scenario) into a single decisive vote.
+    Replaces three correlated agents that each cherry-picked one Kronos metric.
+    """
+    def __init__(self): super().__init__("Kronos (ML Forecast)")
 
-class MomentumBull(Agent):
-    """Trend-following: wants price above EMAs and rising volume."""
-    def __init__(self): super().__init__("Mo (Momentum)", "bull")
+    def analyze(self, ctx):
+        paths = ctx["paths"]
+        price = ctx["price"]
+        fee   = 0.001
 
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        closes = df_1h["close"].values
-        e10    = ema(closes, 10)
-        e20    = ema(closes, 20)
-        vr     = volume_ratio(df_1h["volume"].values)
-        chg_6h = (closes[-1] / closes[-7] - 1) if len(closes) > 7 else 0
-
-        if price > e10 and price > e20 and vr > 1.1 and chg_6h > 0:
-            return {"vote": "BUY",  "reason": f"Price above EMA10/20, vol {vr:.1f}x, +{chg_6h:.2%} 6h"}
-        if price < e20 and chg_6h < -0.02:
-            return {"vote": "SELL", "reason": f"Price below EMA20, {chg_6h:.2%} 6h drop"}
-        return {"vote": "HOLD", "reason": f"Waiting for momentum — vol {vr:.1f}x"}
-
-
-class ValueBull(Agent):
-    """Dip buyer: wants oversold RSI and Kronos showing recovery."""
-    def __init__(self): super().__init__("Warren (Value)", "bull")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        rsi_val  = rsi(df_4h["close"].values[-50:])
-        med_end  = float(np.median(paths[:, -1]) / price - 1)
-        low_48h  = df_1h["low"].values[-48:].min()
-        near_low = price < low_48h * 1.03
-
-        if rsi_val < 45 and med_end > 0.005 and near_low:
-            return {"vote": "BUY",  "reason": f"RSI {rsi_val:.0f} oversold, near 48h low, Kronos +{med_end:.2%}"}
-        if rsi_val > 72 and holding:
-            return {"vote": "SELL", "reason": f"RSI {rsi_val:.0f} — taking profits at top"}
-        return {"vote": "HOLD", "reason": f"RSI {rsi_val:.0f} — not cheap enough yet"}
-
-
-class KronosBull(Agent):
-    """Pure model follower: trusts Kronos conviction above all else."""
-    def __init__(self): super().__init__("Oracle (Kronos)", "bull")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        fee        = 0.001
         peaks      = paths.max(axis=1)
-        net        = (peaks / price) - 1 - (2 * fee)
-        conviction = (net > 0).sum() / len(net)
+        dips       = paths.min(axis=1)
+        conviction = ((peaks / price - 1 - 2 * fee) > 0).sum() / len(peaks)
         med_peak   = float(np.median(peaks) / price - 1)
+        med_dip    = float(np.median(dips)  / price - 1)
+        rr         = (med_peak / abs(med_dip)) if med_dip < 0 else 99.0
 
-        if conviction >= 0.62:
-            return {"vote": "BUY",  "reason": f"{conviction:.0%} paths profitable, median peak +{med_peak:.2%}"}
-        if conviction < 0.38:
-            return {"vote": "SELL", "reason": f"Only {conviction:.0%} paths profitable — model bearish"}
-        return {"vote": "HOLD", "reason": f"Conviction {conviction:.0%} — below threshold"}
-
-
-class BreakoutBull(Agent):
-    """Breakout trader: wants new highs confirmed by volume."""
-    def __init__(self): super().__init__("Rex (Breakout)", "bull")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        high_48h   = df_1h["high"].values[-48:].max()
-        near_break = price >= high_48h * 0.995
-        vr         = volume_ratio(df_1h["volume"].values)
-        chg_1h     = float(df_1h["close"].values[-1] / df_1h["close"].values[-2] - 1)
-
-        if near_break and vr > 1.3 and chg_1h > 0:
-            return {"vote": "BUY",  "reason": f"Breaking 48h high ${high_48h:,.2f}, vol {vr:.1f}x"}
-        if not near_break and holding and price < high_48h * 0.97:
-            return {"vote": "SELL", "reason": f"Broke back below resistance — exit"}
-        return {"vote": "HOLD", "reason": f"{((high_48h-price)/high_48h)*100:.1f}% below 48h high"}
-
-
-class TrendBull(Agent):
-    """Multi-EMA trend alignment: bulls when all EMAs stack up."""
-    def __init__(self): super().__init__("Atlas (Trend)", "bull")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        c4     = df_4h["close"].values
-        e20    = ema(c4, 20)
-        e50    = ema(c4, 50)
-        e100   = ema(c4, 100) if len(c4) >= 100 else ema(c4, len(c4)//2)
-        stacked = e20 > e50 > e100 and price > e20
-
-        if stacked:
-            return {"vote": "BUY",  "reason": f"4h EMAs fully stacked: {e20:,.2f}>{e50:,.2f}>{e100:,.2f}"}
-        if e20 < e50 and holding:
-            return {"vote": "SELL", "reason": f"4h EMA20 {e20:,.2f} crossed below EMA50 {e50:,.2f}"}
-        return {"vote": "HOLD", "reason": f"4h EMAs not fully aligned (EMA20 {'>' if e20>e50 else '<'} EMA50)"}
-
-
-# ── Bear agents ────────────────────────────────────────────────────────────────
-
-class RiskBear(Agent):
-    """Risk manager: vetoes trades with poor reward-to-risk."""
-    def __init__(self): super().__init__("Sigma (Risk)", "bear")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        med_peak = float(np.median(paths.max(axis=1)) / price - 1)
-        med_dip  = float(np.median(paths.min(axis=1)) / price - 1)
-        rr       = (med_peak / abs(med_dip)) if med_dip < 0 else 99
-
-        if rr >= 2.0 and med_peak > 0.005:
-            return {"vote": "BUY",  "reason": f"R/R {rr:.1f}x — upside {med_peak:.2%} vs downside {med_dip:.2%}"}
-        if holding and med_dip < -0.025:
-            return {"vote": "SELL", "reason": f"Forecast dip {med_dip:.2%} too deep — protecting capital"}
-        return {"vote": "HOLD", "reason": f"R/R {rr:.1f}x — insufficient for entry (need 2x+)"}
-
-
-class OverboughtBear(Agent):
-    """RSI guard: refuses to buy extended assets, quick to take profits."""
-    def __init__(self): super().__init__("Cecil (Overbought)", "bear")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        rsi_val = rsi(df_4h["close"].values[-50:])
-        chg_24h = float(df_1h["close"].values[-1] / df_1h["close"].values[-25] - 1) if len(df_1h) > 25 else 0
-
-        if rsi_val < 55 and chg_24h < 0.06:
-            return {"vote": "BUY",  "reason": f"RSI {rsi_val:.0f} fine, 24h move {chg_24h:.2%} — not extended"}
-        if rsi_val > 68 or chg_24h > 0.08:
-            return {"vote": "SELL", "reason": f"RSI {rsi_val:.0f}, +{chg_24h:.2%} 24h — overbought, avoid"}
-        return {"vote": "HOLD", "reason": f"RSI {rsi_val:.0f} — marginal, passing"}
-
-
-class VolatilityBear(Agent):
-    """Volatility cop: pulls the plug when conditions are chaotic."""
-    def __init__(self): super().__init__("Storm (Volatility)", "bear")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        ann_vol  = hourly_vol(df_1h["close"].values)
-        path_std = float(paths[:, -1].std() / price)  # disagreement between paths
-
-        if ann_vol < 0.90 and path_std < 0.025:
-            return {"vote": "BUY",  "reason": f"Vol {ann_vol:.0%} manageable, path spread {path_std:.2%}"}
-        if ann_vol > 1.50 or path_std > 0.05:
-            return {"vote": "SELL", "reason": f"Vol {ann_vol:.0%} extreme or paths disagree {path_std:.2%}"}
-        return {"vote": "HOLD", "reason": f"Vol {ann_vol:.0%} elevated — waiting for calm"}
-
-
-class DoomBear(Agent):
-    """Worst-case analyst: focuses on the bottom 20% of Kronos scenarios."""
-    def __init__(self): super().__init__("Doom (Tail Risk)", "bear")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
         n_bad     = max(1, len(paths) // 5)
-        worst_idx = np.argsort(paths[:, -1])[:n_bad]
-        worst_end = float(paths[worst_idx, -1].mean() / price - 1)
-        worst_dip = float(paths[worst_idx].min(axis=1).mean() / price - 1)
+        worst_dip = float(paths[np.argsort(paths[:, -1])[:n_bad]].min(axis=1).mean() / price - 1)
 
-        if worst_end > -0.015 and worst_dip > -0.025:
-            return {"vote": "BUY",  "reason": f"Worst 20%: end {worst_end:.2%}, dip {worst_dip:.2%} — acceptable"}
-        if worst_dip < -0.04 and holding:
-            return {"vote": "SELL", "reason": f"Worst 20% dip {worst_dip:.2%} — tail risk too high"}
-        return {"vote": "HOLD", "reason": f"Worst 20% dip {worst_dip:.2%} — too risky to enter"}
-
-
-class ContraryBear(Agent):
-    """Contrarian: fades consensus when everyone screams BUY."""
-    def __init__(self): super().__init__("Contra (Contrarian)", "bear")
-
-    def analyze(self, paths, df_1h, df_4h, price, holding):
-        fee        = 0.001
-        peaks      = paths.max(axis=1)
-        conviction = ((peaks / price) - 1 - (2 * fee) > 0).sum() / len(peaks)
-        vr         = volume_ratio(df_1h["volume"].values)
-        chg_4h     = float(df_1h["close"].values[-1] / df_1h["close"].values[-5] - 1) if len(df_1h) > 5 else 0
-
-        # FOMO warning: high conviction + volume surge + already moved = dangerous
-        fomo_score = (conviction > 0.80) + (vr > 2.0) + (chg_4h > 0.04)
-        if fomo_score >= 2:
-            return {"vote": "SELL", "reason": f"FOMO alert: conviction {conviction:.0%}, vol {vr:.1f}x, +{chg_4h:.2%} 4h"}
-        if conviction < 0.75 or fomo_score == 0:
-            return {"vote": "BUY",  "reason": f"No FOMO detected — conviction {conviction:.0%} reasonable"}
-        return {"vote": "HOLD", "reason": f"Mildly cautious — watching for FOMO spike"}
+        if conviction >= 0.65 and rr >= 2.0 and worst_dip > -0.035:
+            return {"vote": "BUY",
+                    "reason": f"conviction {conviction:.0%}, R/R {rr:.1f}x, tail {worst_dip:.2%}"}
+        if conviction < 0.35 or worst_dip < -0.06:
+            return {"vote": "SELL",
+                    "reason": f"conviction {conviction:.0%}, tail risk {worst_dip:.2%} — model bearish"}
+        return {"vote": "HOLD",
+                "reason": f"conviction {conviction:.0%}, R/R {rr:.1f}x — below threshold"}
 
 
-# ── Council ────────────────────────────────────────────────────────────────────
+class PositioningAgent(Agent):
+    """
+    Futures market crowding: L/S ratio shows which side retail is on,
+    funding rate shows which side is paying a premium to hold.
+    Shorts crowded + negative funding = squeeze setup (bullish).
+    Longs crowded + high funding = flush risk (bearish).
+    """
+    def __init__(self): super().__init__("Positioning (L/S + Funding)")
+
+    def analyze(self, ctx):
+        long_ratio   = ctx.get("long_ratio", 0.5)
+        funding_rate = ctx.get("funding_rate", 0.0)
+
+        squeeze = long_ratio < 0.43 and funding_rate < 0.0
+        crowded = long_ratio > 0.63 and funding_rate > 0.0004
+
+        if squeeze:
+            return {"vote": "BUY",
+                    "reason": f"shorts crowded ({long_ratio:.0%} long), funding {funding_rate*100:+.4f}% — squeeze setup"}
+        if long_ratio < 0.47:
+            return {"vote": "BUY",
+                    "reason": f"shorts dominant ({long_ratio:.0%} long) — positioning favours upside"}
+        if crowded:
+            return {"vote": "SELL",
+                    "reason": f"longs crowded ({long_ratio:.0%}), funding {funding_rate*100:+.4f}% — flush risk"}
+        if long_ratio > 0.67:
+            return {"vote": "SELL",
+                    "reason": f"longs overcrowded ({long_ratio:.0%}) — retail euphoria, fade signal"}
+        return {"vote": "HOLD",
+                "reason": f"positioning neutral ({long_ratio:.0%} long, funding {funding_rate*100:+.4f}%)"}
+
+
+class MarketStructureAgent(Agent):
+    """
+    OI change vs price direction reveals who's in control.
+    OI up + price up = healthy long accumulation (bullish).
+    OI up + price down = shorts piling in aggressively (bearish).
+    OI flushed = forced deleveraging over, safer to enter (bullish).
+    """
+    def __init__(self): super().__init__("Market Structure (OI)")
+
+    def analyze(self, ctx):
+        oi_chg = ctx.get("oi_change_24h", 0.0)
+        closes = ctx["df_1h"]["close"].values
+        px_chg = float(closes[-1] / closes[-25] - 1) if len(closes) > 25 else 0
+
+        if oi_chg > 0.04 and px_chg > 0.01:
+            return {"vote": "BUY",
+                    "reason": f"OI +{oi_chg:.1%} with price +{px_chg:.1%} — healthy long accumulation"}
+        if oi_chg < -0.05:
+            return {"vote": "BUY",
+                    "reason": f"OI flushed {oi_chg:.1%} — forced deleveraging done, safer entry"}
+        if oi_chg > 0.06 and px_chg < -0.01:
+            return {"vote": "SELL",
+                    "reason": f"OI +{oi_chg:.1%} while price {px_chg:.1%} — shorts piling in"}
+        if oi_chg > 0.03 and px_chg < -0.02:
+            return {"vote": "SELL",
+                    "reason": f"OI rising into price weakness — bearish divergence"}
+        return {"vote": "HOLD",
+                "reason": f"OI {oi_chg:+.1%}, price {px_chg:+.1%} — no clear structure signal"}
+
+
+class MacroRegimeAgent(Agent):
+    """
+    CoinGecko global: total crypto market cap change signals risk appetite.
+    Rising market cap = risk-on (buy). Falling = risk-off (sell).
+    For alts: rising BTC dominance means capital rotating to BTC specifically,
+    which can be a headwind for ETH.
+    """
+    def __init__(self): super().__init__("Macro Regime (CoinGecko)")
+
+    def analyze(self, ctx):
+        macro   = ctx.get("macro", {})
+        cap_chg = macro.get("cap_chg_24h", 0.0)
+        btc_dom = macro.get("btc_dominance", 50.0)
+        asset   = ctx.get("asset", "BTC/USD")
+
+        risk_on  = cap_chg > 1.5
+        risk_off = cap_chg < -2.0
+
+        if risk_on:
+            if asset != "BTC/USD" and btc_dom > 58:
+                return {"vote": "HOLD",
+                        "reason": f"market +{cap_chg:.1f}% but BTC dom {btc_dom:.1f}% — alt headwind"}
+            return {"vote": "BUY",
+                    "reason": f"total market cap +{cap_chg:.1f}% — risk-on regime"}
+        if risk_off:
+            return {"vote": "SELL",
+                    "reason": f"total market cap {cap_chg:.1f}% — risk-off, reduce exposure"}
+        if cap_chg < -0.5:
+            return {"vote": "HOLD",
+                    "reason": f"market cap {cap_chg:.1f}% — mild headwind, cautious"}
+        return {"vote": "BUY",
+                "reason": f"macro neutral-positive (cap {cap_chg:+.1f}%, BTC dom {btc_dom:.1f}%)"}
+
+
+class OrderFlowAgent(Agent):
+    """
+    Real-time order book: bid vs ask volume in the top 25 price levels.
+    A dominant bid wall means active buy pressure at current price.
+    A dominant ask wall means active sell pressure (supply overhead).
+    This is the only agent using live microstructure data.
+    """
+    def __init__(self): super().__init__("Order Flow (Book)")
+
+    def analyze(self, ctx):
+        ob  = ctx.get("orderbook", {})
+        imb = ob.get("imbalance", 0.5)
+
+        if imb >= 0.62:
+            return {"vote": "BUY",
+                    "reason": f"bid wall dominant ({imb:.0%} bids) — active buy pressure"}
+        if imb >= 0.55:
+            return {"vote": "BUY",
+                    "reason": f"bids favoured ({imb:.0%}) — mild buy pressure"}
+        if imb <= 0.38:
+            return {"vote": "SELL",
+                    "reason": f"ask wall dominant ({imb:.0%} bids) — active sell pressure"}
+        if imb <= 0.45:
+            return {"vote": "SELL",
+                    "reason": f"asks favoured ({imb:.0%} bids) — mild sell pressure"}
+        return {"vote": "HOLD",
+                "reason": f"order book balanced ({imb:.0%} bids)"}
+
+
+class SentimentAgent(Agent):
+    """
+    Fear & Greed index as a standalone contrarian vote.
+    Extreme fear = historically excellent buy zones (capitulation).
+    Extreme greed = historically poor entries (euphoria peaks).
+    Previously a weak modifier; now a full independent vote.
+    """
+    def __init__(self): super().__init__("Sentiment (Fear & Greed)")
+
+    def analyze(self, ctx):
+        fg_value = ctx.get("fg_value", 50)
+        fg_label = ctx.get("fg_label", "Unknown")
+
+        if fg_value <= 20:
+            return {"vote": "BUY",
+                    "reason": f"F&G {fg_value}/100 ({fg_label}) — extreme fear = historically great entry"}
+        if fg_value <= 40:
+            return {"vote": "BUY",
+                    "reason": f"F&G {fg_value}/100 ({fg_label}) — fear zone, good contrarian entry"}
+        if fg_value <= 60:
+            return {"vote": "HOLD",
+                    "reason": f"F&G {fg_value}/100 ({fg_label}) — sentiment neutral"}
+        if fg_value <= 80:
+            return {"vote": "SELL",
+                    "reason": f"F&G {fg_value}/100 ({fg_label}) — greed elevated, caution"}
+        return {"vote": "SELL",
+                "reason": f"F&G {fg_value}/100 ({fg_label}) — extreme greed = historically poor entry"}
+
+
+class MultiTimeframeAgent(Agent):
+    """
+    1h and 4h price structure must both agree before a vote fires.
+    Replaces MomentumBull + TrendBull which were 80% correlated (both
+    just checked if EMAs were stacked). Now requires full confluence:
+    1h above EMA20, 4h EMA20 above EMA50, 4h RSI not overbought.
+    """
+    def __init__(self): super().__init__("Multi-TF (1h + 4h)")
+
+    def analyze(self, ctx):
+        df_1h   = ctx["df_1h"]
+        df_4h   = ctx["df_4h"]
+        price   = ctx["price"]
+        holding = ctx.get("holding", False)
+
+        c1 = df_1h["close"].values
+        c4 = df_4h["close"].values
+
+        e20_1h = ema(c1, 20)
+        e20_4h = ema(c4, 20)
+        e50_4h = ema(c4, 50)
+        rsi_4h = rsi(c4[-50:])
+        chg_24h = float(c1[-1] / c1[-25] - 1) if len(c1) > 25 else 0
+
+        bull_1h        = price > e20_1h
+        bull_4h        = e20_4h > e50_4h
+        not_overbought = rsi_4h < 72
+        rising_24h     = chg_24h > 0
+
+        score = sum([bull_1h, bull_4h, not_overbought, rising_24h])
+
+        if score >= 4:
+            return {"vote": "BUY",
+                    "reason": f"all TF aligned: 1h>{e20_1h:,.0f}, EMA20>{e50_4h:,.0f}(4h), RSI {rsi_4h:.0f}"}
+        if score >= 3 and bull_4h:
+            return {"vote": "BUY",
+                    "reason": f"TF mostly aligned (4h trend up, RSI {rsi_4h:.0f}, 24h {chg_24h:+.2%})"}
+        if not bull_4h and not bull_1h:
+            return {"vote": "SELL",
+                    "reason": f"both TF bearish: EMA20(4h) {e20_4h:,.0f}<EMA50 {e50_4h:,.0f}, price<1h EMA"}
+        if not bull_4h and holding:
+            return {"vote": "SELL",
+                    "reason": f"4h trend broken (EMA20 {e20_4h:,.0f} < EMA50 {e50_4h:,.0f}) — exit signal"}
+        return {"vote": "HOLD",
+                "reason": f"mixed TF signals ({score}/4 bullish, RSI {rsi_4h:.0f})"}
+
+
+# ── Council (7 agents) ─────────────────────────────────────────────────────────
 
 COUNCIL = [
-    MomentumBull(), ValueBull(), KronosBull(), BreakoutBull(), TrendBull(),
-    RiskBear(), OverboughtBear(), VolatilityBear(), DoomBear(), ContraryBear(),
+    KronosAgent(),
+    PositioningAgent(),
+    MarketStructureAgent(),
+    MacroRegimeAgent(),
+    OrderFlowAgent(),
+    SentimentAgent(),
+    MultiTimeframeAgent(),
 ]
 
-def run_council(paths, df_1h, df_4h, price, holding, fg_pts=0, funding_pts=0):
+def run_council(ctx):
     results = []
     for agent in COUNCIL:
         try:
-            r = agent.analyze(paths, df_1h, df_4h, price, holding)
+            r = agent.analyze(ctx)
         except Exception as e:
             r = {"vote": "HOLD", "reason": f"Error: {e}"}
-        results.append({"name": agent.name, "bias": agent.bias, **r})
+        results.append({"name": agent.name, **r})
 
     buy_votes  = sum(1 for r in results if r["vote"] == "BUY")
     sell_votes = sum(1 for r in results if r["vote"] == "SELL")
+    holding    = ctx.get("holding", False)
 
-    # Fear/Greed and funding rate act as vote modifiers (not full agents)
-    # Combined bonus > +15 can tip a 7-vote situation to 8 (effectively)
-    context_score = fg_pts + funding_pts
-    effective_buy_votes  = buy_votes  + (1 if context_score >= 15 else 0)
-    effective_sell_votes = sell_votes + (1 if context_score <= -15 else 0)
-
-    if effective_buy_votes >= BUY_VOTES_NEEDED and not holding:
+    if buy_votes >= BUY_VOTES_NEEDED and not holding:
         verdict = "BUY"
-    elif effective_sell_votes >= SELL_VOTES_NEEDED and holding:
+    elif sell_votes >= SELL_VOTES_NEEDED and holding:
         verdict = "SELL"
     elif holding:
         verdict = "HOLD"
@@ -421,20 +530,19 @@ def run_council(paths, df_1h, df_4h, price, holding, fg_pts=0, funding_pts=0):
         verdict = "WAIT"
 
     return {
-        "verdict": verdict,
-        "buy_votes": buy_votes,
+        "verdict":    verdict,
+        "buy_votes":  buy_votes,
         "sell_votes": sell_votes,
-        "context_score": context_score,
-        "agents": results,
+        "agents":     results,
     }
 
 # ── Position sizing ────────────────────────────────────────────────────────────
 
 def calc_position_usd(buy_votes, portfolio, prices):
     tv = total_value(portfolio, prices)
-    if   buy_votes >= 9: alloc = SIZE_HIGH
-    elif buy_votes >= 8: alloc = SIZE_MED
-    else:                alloc = SIZE_LOW
+    if   buy_votes >= 7: alloc = SIZE_HIGH   # near-unanimous
+    elif buy_votes >= 6: alloc = SIZE_MED
+    else:                alloc = SIZE_LOW    # bare majority (5/7)
     headroom = max(0, MAX_DEPLOYED - deployed_pct(portfolio, prices))
     alloc    = min(alloc, headroom)
     return min(tv * alloc, portfolio["usd"])
@@ -477,7 +585,7 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
         print(f"║ {text}{' ' * max(0,pad)} ║")
 
     print("\n╔" + "═" * w + "╗")
-    hdr = f"  SIGNAL AGENT  │  10-Agent Council  │  {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    hdr = f"  SIGNAL AGENT  │  7-Agent Council  │  {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     print(f"║{hdr}{' ' * max(0, w - len(hdr))}║")
     print("╠" + "═" * w + "╣")
     row()
@@ -489,8 +597,9 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
     if context:
         fg_v = context.get("fg_value", 50)
         fg_l = context.get("fg_label", "?")
-        fg_p = context.get("fg_pts", 0)
-        row(f"  Fear & Greed: {fg_v}/100 — {fg_l}  ({fg_p:+d} pts context bonus)")
+        macro = context.get("macro", {})
+        cap_chg = macro.get("cap_chg_24h", 0.0)
+        row(f"  F&G: {fg_v}/100 ({fg_l})  │  Market cap 24h: {cap_chg:+.1f}%")
     row()
 
     for asset, res in results.items():
@@ -499,7 +608,8 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
         verdict = council["verdict"]
         bv      = council["buy_votes"]
         sv      = council["sell_votes"]
-        ticker  = asset.replace("/USDT", "")
+        ctx     = res.get("ctx", {})
+        ticker  = asset.replace("/USD", "")
 
         print("╠" + "═" * w + "╣")
         row()
@@ -507,32 +617,23 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
         row(f"  {ticker}  ${price:,.4f}    {label}   ({bv} buy / {sv} sell)")
         row()
 
-        # Agent vote grid
-        row("  BULLS                              BEARS")
-        bull_agents = [a for a in council["agents"] if a["bias"] == "bull"]
-        bear_agents = [a for a in council["agents"] if a["bias"] == "bear"]
-        for b, br in zip(bull_agents, bear_agents):
-            bv_icon = VOTE_ICONS[b["vote"]]
-            brv_icon = VOTE_ICONS[br["vote"]]
-            b_col  = f"{bv_icon} {b['name']:<20}"
-            br_col = f"{brv_icon} {br['name']}"
-            row(f"  {b_col}  │  {br_col}")
-        row()
-
-        # Reasoning for each agent
-        row("  Agent reasoning:")
+        row("  Agent votes:")
         for a in council["agents"]:
             icon   = VOTE_ICONS[a["vote"]]
-            prefix = f"  {icon} {a['name']:<22}"
+            prefix = f"  {icon} {a['name']:<32}"
             reason = a["reason"]
-            # truncate long reasons
             if len(prefix) + len(reason) > w - 2:
                 reason = reason[:w - 2 - len(prefix) - 3] + "..."
             row(f"{prefix}{reason}")
+        row()
 
-        # Funding rate
-        fund_rate, fund_pts = res.get("funding", (0.0, 0))
-        row(f"  Funding rate: {fund_rate*100:+.4f}%  ({fund_pts:+d} pts context bonus)")
+        # Derivatives context
+        fund_rate  = ctx.get("funding_rate", 0.0)
+        oi_chg     = ctx.get("oi_change_24h", 0.0)
+        long_ratio = ctx.get("long_ratio", 0.5)
+        ob_imb     = ctx.get("orderbook", {}).get("imbalance", 0.5)
+        row(f"  Funding: {fund_rate*100:+.4f}%  │  OI 24h: {oi_chg:+.1%}"
+            f"  │  L/S: {long_ratio:.0%}  │  Book: {ob_imb:.0%} bid")
 
         # Open position
         if asset in portfolio["positions"]:
@@ -548,11 +649,11 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
         row("  Recent trades:")
         for t in recent:
             if t["type"] == "SELL":
-                row(f"  {t['time'][:16]}  SELL {t['asset'].replace('/USDT','')}  P&L {t['pnl_pct']:+.1f}%  [{t['reason']}]")
+                row(f"  {t['time'][:16]}  SELL {t['asset'].replace('/USD','')}  P&L {t['pnl_pct']:+.1f}%  [{t['reason']}]")
             else:
-                row(f"  {t['time'][:16]}  BUY  {t['asset'].replace('/USDT','')}  ${t['usd']:,.0f}")
+                row(f"  {t['time'][:16]}  BUY  {t['asset'].replace('/USD','')}  ${t['usd']:,.0f}")
         row()
-    row(f"  Next check in {next_min} min  (need {BUY_VOTES_NEEDED}/10 to BUY, {SELL_VOTES_NEEDED}/10 to SELL)")
+    row(f"  Next check in {next_min} min  (need {BUY_VOTES_NEEDED}/7 to BUY, {SELL_VOTES_NEEDED}/7 to SELL)")
     print("╚" + "═" * w + "╝")
     sys.stdout.flush()
 
@@ -561,28 +662,23 @@ def print_dashboard(results, portfolio, prices, next_min, context=None):
 ALERT_EMAIL = "hunterpearce14@gmail.com"
 
 def send_signal_email(subject, asset, action, price, council, portfolio, prices, extra=""):
-    """Send email only when a real trade signal fires."""
     password = os.environ.get("EMAIL_PASSWORD", "")
     if not password:
         print(f"  [email] No EMAIL_PASSWORD set — skipping email for {subject}")
         return
 
-    tv      = total_value(portfolio, prices)
-    pnl     = tv - portfolio["start_value"]
-    agents  = council["agents"]
-    bulls   = [a for a in agents if a["bias"] == "bull"]
-    bears   = [a for a in agents if a["bias"] == "bear"]
-    bv, sv  = council["buy_votes"], council["sell_votes"]
+    tv     = total_value(portfolio, prices)
+    pnl    = tv - portfolio["start_value"]
+    agents = council["agents"]
+    bv     = council["buy_votes"]
+    sv     = council["sell_votes"]
+    icon   = "▲" if action == "BUY" else ("▼" if action == "SELL" else "⚠")
+    ticker = asset.replace("/USD", "")
 
-    icon    = "▲" if action == "BUY" else ("▼" if action == "SELL" else "⚠")
-    ticker  = asset.replace("/USDT", "")
-
-    def agent_lines(group):
-        lines = []
-        for a in group:
-            v = {"BUY": "▲", "SELL": "▼", "HOLD": "·"}[a["vote"]]
-            lines.append(f"  {v}  {a['name']:<24} {a['reason']}")
-        return "\n".join(lines)
+    agent_lines = "\n".join(
+        f"  {VOTE_ICONS[a['vote']]}  {a['name']:<32} {a['reason']}"
+        for a in agents
+    )
 
     body = f"""\
 {icon} SIGNAL AGENT — {action} CONFIRMED
@@ -592,13 +688,10 @@ Asset:   {asset}
 Action:  {action}
 Price:   ${price:,.4f}
 {extra}
-Council: {bv}/10 buy votes  |  {sv}/10 sell votes
+Council: {bv}/7 buy votes  |  {sv}/7 sell votes
 
-BULL AGENTS:
-{agent_lines(bulls)}
-
-BEAR AGENTS:
-{agent_lines(bears)}
+AGENTS:
+{agent_lines}
 
 {'━' * 52}
 Portfolio: ${tv:,.2f}  |  P&L: {pnl:+.2f} ({pnl/portfolio['start_value']*100:+.1f}%)
@@ -608,7 +701,7 @@ Signal Agent — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
 """
 
     msg = MIMEMultipart()
-    msg["Subject"] = f"{icon} {action}: {ticker} @ ${price:,.2f} — {bv}/10 agents"
+    msg["Subject"] = f"{icon} {action}: {ticker} @ ${price:,.2f} — {bv}/7 agents"
     msg["From"]    = ALERT_EMAIL
     msg["To"]      = ALERT_EMAIL
     msg.attach(MIMEText(body, "plain"))
@@ -636,55 +729,73 @@ def run_cycle(predictor, portfolio):
 
     print(f"[{datetime.now().strftime('%H:%M')}] Fetching candles...", end=" ", flush=True)
     for asset in ASSETS:
-        df_1h = fetch_candles(asset, "1h",  limit=LOOKBACK_1H + 20)
-        df_4h = fetch_candles(asset, "4h",  limit=LOOKBACK_4H + 20)
+        df_1h = fetch_candles(asset, "1h", limit=LOOKBACK_1H + 20)
+        df_4h = fetch_candles(asset, "4h", limit=LOOKBACK_4H + 20)
         prices[asset]     = float(df_1h["close"].iloc[-1])
         asset_data[asset] = (df_1h, df_4h)
     print("done.")
 
     print(f"[{datetime.now().strftime('%H:%M')}] Fetching market context...", end=" ", flush=True)
-    fg_value, fg_label, fg_pts = fetch_fear_greed()
-    funding_rates = fetch_funding_rates()
-    print(f"F&G={fg_value} ({fg_label}), funding fetched.")
+    fg_value, fg_label = fetch_fear_greed()
+    funding_rates      = fetch_funding_rates()
+    onchain_data       = {asset: fetch_onchain(asset) for asset in ASSETS}
+    macro              = fetch_macro()
+    orderbook_data     = {asset: fetch_orderbook(asset) for asset in ASSETS}
+    print(f"F&G={fg_value} ({fg_label}), macro cap {macro.get('cap_chg_24h',0):+.1f}%, OI+book fetched.")
 
     print(f"[{datetime.now().strftime('%H:%M')}] Running Kronos + council ({SAMPLE_COUNT} paths × {len(ASSETS)} assets)...", end=" ", flush=True)
     results = {}
     for asset, (df_1h, df_4h) in asset_data.items():
-        price        = prices[asset]
-        holding      = asset in portfolio["positions"]
-        paths        = kronos_paths(df_1h, predictor)
-        fund_pts     = funding_rates.get(asset, (0.0, 0))[1]
-        council      = run_council(paths, df_1h, df_4h, price, holding, fg_pts, fund_pts)
-        results[asset] = {
-            "council": council, "paths": paths,
-            "df_1h": df_1h, "df_4h": df_4h,
-            "funding": funding_rates.get(asset, (0.0, 0)),
+        price   = prices[asset]
+        holding = asset in portfolio["positions"]
+        paths   = kronos_paths(df_1h, predictor)
+        onchain = onchain_data.get(asset, {})
+
+        ctx = {
+            "paths":         paths,
+            "df_1h":         df_1h,
+            "df_4h":         df_4h,
+            "price":         price,
+            "holding":       holding,
+            "asset":         asset,
+            "long_ratio":    onchain.get("long_ratio", 0.5),
+            "oi_change_24h": onchain.get("oi_change_24h", 0.0),
+            "funding_rate":  funding_rates.get(asset, 0.0),
+            "macro":         macro,
+            "orderbook":     orderbook_data.get(asset, {}),
+            "fg_value":      fg_value,
+            "fg_label":      fg_label,
         }
+        council = run_council(ctx)
+        results[asset] = {"council": council, "paths": paths, "ctx": ctx,
+                          "df_1h": df_1h, "df_4h": df_4h}
     print("done.")
-    # Store context for dashboard
-    results["_context"] = {"fg_value": fg_value, "fg_label": fg_label, "fg_pts": fg_pts}
+
+    # Store shared context for dashboard
+    results["_context"] = {"fg_value": fg_value, "fg_label": fg_label, "macro": macro}
 
     # Stop-loss checks
     for asset, pos in list(portfolio["positions"].items()):
         if prices[asset] <= pos["stop"]:
-            pnl    = paper_sell(portfolio, asset, prices[asset], reason="stop-loss")
+            pnl = paper_sell(portfolio, asset, prices[asset], reason="stop-loss")
             print(f"  ⚠ STOP-LOSS: {asset} @ ${prices[asset]:,.4f}  ({pnl:+.1f}%)")
             send_signal_email(
                 f"Stop-Loss: {asset}", asset, "STOP", prices[asset],
                 results[asset]["council"], portfolio, prices,
                 extra=f"P&L:    {pnl:+.1f}%",
             )
-            df_1h, df_4h = asset_data[asset]
-            fund_pts = results[asset]["funding"][1]
-            results[asset]["council"] = run_council(
-                results[asset]["paths"], df_1h, df_4h, prices[asset], False, fg_pts, fund_pts)
+            # Re-run council with holding=False
+            new_ctx = {**results[asset]["ctx"], "holding": False}
+            results[asset]["council"] = run_council(new_ctx)
+            results[asset]["ctx"]     = new_ctx
 
     sells = [(a, r) for a, r in results.items() if isinstance(r, dict) and r.get("council", {}).get("verdict") == "SELL"]
     buys  = [(a, r) for a, r in results.items() if isinstance(r, dict) and r.get("council", {}).get("verdict") == "BUY"]
 
     for asset, res in sells:
         pnl = paper_sell(portfolio, asset, prices[asset], reason="council")
-        print(f"  ▼ SELL {asset}: P&L {pnl:+.1f}% ({res['council']['sell_votes']}/10 voted sell)")
+        sv  = res["council"]["sell_votes"]
+        print(f"  ▼ SELL {asset}: P&L {pnl:+.1f}% ({sv}/7 voted sell)")
         send_signal_email(
             f"SELL: {asset}", asset, "SELL", prices[asset],
             res["council"], portfolio, prices,
@@ -698,14 +809,14 @@ def run_cycle(predictor, portfolio):
         paths = res["paths"]
         dip   = float(np.median(paths.min(axis=1)) / prices[asset] - 1)
         stop  = prices[asset] * (1 + dip * STOP_BUFFER)
-        stop  = min(stop, prices[asset] * 0.97)
+        stop  = min(stop, prices[asset] * 0.950)
         qty   = paper_buy(portfolio, asset, usd, prices[asset], stop)
         bv    = res["council"]["buy_votes"]
-        print(f"  ▲ BUY  {asset}: {qty:.6f} (${usd:.0f}) @ ${prices[asset]:,.4f}  [{bv}/10]  Stop: ${stop:,.4f}")
+        print(f"  ▲ BUY  {asset}: {qty:.6f} (${usd:.0f}) @ ${prices[asset]:,.4f}  [{bv}/7]  Stop: ${stop:,.4f}")
         send_signal_email(
             f"BUY: {asset}", asset, "BUY", prices[asset],
             res["council"], portfolio, prices,
-            extra=f"Amount:  ${usd:.0f}  ({qty:.6f} {asset.replace('/USDT','')})\nStop:    ${stop:,.4f}",
+            extra=f"Amount:  ${usd:.0f}  ({qty:.6f} {asset.replace('/USD','')})\nStop:    ${stop:,.4f}",
         )
 
     save_portfolio(portfolio)
@@ -713,7 +824,7 @@ def run_cycle(predictor, portfolio):
     next_min = 60 - datetime.now().minute
     context  = results.pop("_context", {})
     display_results = {
-        a: {"council": r["council"], "funding": r.get("funding", (0, 0))}
+        a: {"council": r["council"], "ctx": r.get("ctx", {})}
         for a, r in results.items() if isinstance(r, dict) and "council" in r
     }
     print_dashboard(display_results, portfolio, prices, next_min, context)
@@ -725,7 +836,6 @@ def send_weekly_summary(portfolio):
         print("[email] No EMAIL_PASSWORD — skipping weekly summary")
         return
 
-    # Fetch current prices for unrealised P&L
     prices = {}
     try:
         exchange = ccxt.kraken({"enableRateLimit": True})
@@ -742,45 +852,40 @@ def send_weekly_summary(portfolio):
     pnl_pct = pnl / portfolio["start_value"] * 100
     dep     = deployed_pct(portfolio, prices) * 100
 
-    # Weekly trades (last 7 days)
-    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    cutoff      = (datetime.now() - timedelta(days=7)).isoformat()
     week_trades = [t for t in portfolio["trades"] if t["time"] >= cutoff]
-    closed = [t for t in week_trades if t["type"] == "SELL"]
+    closed      = [t for t in week_trades if t["type"] == "SELL"]
+    wins        = [t for t in closed if t.get("pnl_pct", 0) > 0]
+    losses      = [t for t in closed if t.get("pnl_pct", 0) <= 0]
+    win_rate    = len(wins) / len(closed) * 100 if closed else 0
+    best        = max(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
+    worst       = min(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
 
-    wins      = [t for t in closed if t.get("pnl_pct", 0) > 0]
-    losses    = [t for t in closed if t.get("pnl_pct", 0) <= 0]
-    win_rate  = len(wins) / len(closed) * 100 if closed else 0
-    best      = max(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
-    worst     = min(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
-
-    # Open positions
     pos_lines = []
     for asset, pos in portfolio["positions"].items():
-        price   = prices.get(asset, pos["entry"])
-        unreal  = (price / pos["entry"] - 1) * 100
-        val     = pos["qty"] * price
+        price  = prices.get(asset, pos["entry"])
+        unreal = (price / pos["entry"] - 1) * 100
+        val    = pos["qty"] * price
         pos_lines.append(
             f"  {asset:<12}  {pos['qty']:.6f}  entry ${pos['entry']:,.4f}  "
             f"now ${price:,.4f}  ({unreal:+.1f}%)  value ${val:,.2f}"
         )
 
-    # Trade history this week
     trade_lines = []
     for t in week_trades[-20:]:
         if t["type"] == "SELL":
             trade_lines.append(
-                f"  {t['time'][:16]}  SELL  {t['asset'].replace('/USDT',''):<5}  "
+                f"  {t['time'][:16]}  SELL  {t['asset'].replace('/USD',''):<5}  "
                 f"@ ${t['price']:,.4f}  P&L {t.get('pnl_pct', 0):+.1f}%  [{t.get('reason','')}]"
             )
         else:
             trade_lines.append(
-                f"  {t['time'][:16]}  BUY   {t['asset'].replace('/USDT',''):<5}  "
+                f"  {t['time'][:16]}  BUY   {t['asset'].replace('/USD',''):<5}  "
                 f"@ ${t['price']:,.4f}  ${t.get('usd', 0):,.0f} deployed"
             )
 
-    progress_bar_len = 30
-    filled = int(progress_bar_len * min(tv, 5000) / 5000)
-    bar    = "█" * filled + "░" * (progress_bar_len - filled)
+    filled = int(30 * min(tv, 5000) / 5000)
+    bar    = "█" * filled + "░" * (30 - filled)
 
     body = f"""\
 📊 WEEKLY PORTFOLIO SUMMARY
@@ -804,13 +909,13 @@ OPEN POSITIONS ({len(portfolio['positions'])})
 {'━' * 52}
 THIS WEEK'S TRADES ({len(week_trades)})
   Closed:    {len(closed)}  |  Wins: {len(wins)}  |  Losses: {len(losses)}  |  Win rate: {win_rate:.0f}%
-  Best:      {f"{best['asset'].replace('/USDT','')} {best['pnl_pct']:+.1f}%" if best else 'N/A'}
-  Worst:     {f"{worst['asset'].replace('/USDT','')} {worst['pnl_pct']:+.1f}%" if worst else 'N/A'}
+  Best:      {f"{best['asset'].replace('/USD','')} {best['pnl_pct']:+.1f}%" if best else 'N/A'}
+  Worst:     {f"{worst['asset'].replace('/USD','')} {worst['pnl_pct']:+.1f}%" if worst else 'N/A'}
 
 {chr(10).join(trade_lines) if trade_lines else '  No trades this week'}
 
 {'━' * 52}
-Checks run every 2 hours. Signals require 8/10 agents to BUY, 7/10 to SELL.
+Checks run every 2 hours. Signals require {BUY_VOTES_NEEDED}/7 agents to BUY, {SELL_VOTES_NEEDED}/7 to SELL.
 Signal Agent — hunterpearce14@gmail.com
 """
 
@@ -831,7 +936,7 @@ Signal Agent — hunterpearce14@gmail.com
 
 def run_backtest():
     """
-    Technical-only backtest over last ~90 days of hourly data.
+    Technical-only backtest over ~90 days of hourly data.
     Skips Kronos (too slow for 100+ windows) — tests RSI/EMA/volume edge only.
     """
     print("Running backtest (technical signals only, ~90 days)...")
@@ -839,8 +944,8 @@ def run_backtest():
 
     for asset in ASSETS:
         print(f"\n{'─'*50}\n{asset}")
-        raw   = exchange.fetch_ohlcv(asset, "1h", limit=2000)
-        df    = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+        raw    = exchange.fetch_ohlcv(asset, "1h", limit=2000)
+        df     = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
         closes = df["close"].values
         vols   = df["volume"].values
 
@@ -854,9 +959,7 @@ def run_backtest():
             vr       = volume_ratio(vols[max(0,i-21):i+1])
             trend_up = e20 > e50
 
-            # Entry: oversold + uptrend + volume
             buy_sig  = rsi_val < 45 and trend_up and vr > 1.0
-            # Exit: overbought OR trend breaks
             sell_sig = rsi_val > 65 or e20 < e50
 
             if position is None and buy_sig:
@@ -870,12 +973,12 @@ def run_backtest():
             print("  No completed trades in window")
             continue
 
-        wins     = [t for t in trades if t > 0]
-        losses   = [t for t in trades if t <= 0]
-        win_rate = len(wins) / len(trades) * 100
-        avg_win  = np.mean(wins)  if wins   else 0
-        avg_loss = np.mean(losses) if losses else 0
-        total    = sum(trades)
+        wins       = [t for t in trades if t > 0]
+        losses     = [t for t in trades if t <= 0]
+        win_rate   = len(wins) / len(trades) * 100
+        avg_win    = np.mean(wins)   if wins   else 0
+        avg_loss   = np.mean(losses) if losses else 0
+        total      = sum(trades)
         expectancy = (win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss)
 
         print(f"  Trades:      {len(trades)}  ({len(wins)}W / {len(losses)}L)")
@@ -887,7 +990,7 @@ def run_backtest():
         verdict = "✅ Positive edge" if expectancy > 0 else "❌ No edge detected"
         print(f"  Verdict:     {verdict}")
 
-    print("\nNote: this tests technical signals only. Kronos + agent council may differ.")
+    print("\nNote: this tests technical signals only. Kronos + full agent council may differ.")
 
 
 def main():
