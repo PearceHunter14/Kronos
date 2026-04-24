@@ -156,57 +156,56 @@ def fetch_fear_greed():
 
 
 def fetch_funding_rates():
-    """
-    BTC/ETH perpetual funding rate from Bybit.
-    Returns dict: asset → (rate: float)
-    """
-    perp_map = {
-        "BTC/USD": "BTC/USDT:USDT",
-        "ETH/USD": "ETH/USDT:USDT",
-    }
-    results = {}
-    try:
-        bybit = ccxt.bybit({"enableRateLimit": True})
-        for spot, perp in perp_map.items():
-            info = bybit.fetch_funding_rate(perp)
-            results[spot] = float(info["fundingRate"])
-    except Exception:
-        results = {a: 0.0 for a in ASSETS}
+    """OKX linear perp funding rates — public API, works from CI runners."""
+    okx_map = {"BTC/USD": "BTC-USDT-SWAP", "ETH/USD": "ETH-USDT-SWAP"}
+    results = {a: 0.0 for a in ASSETS}
+    for asset, inst_id in okx_map.items():
+        try:
+            r    = requests.get("https://www.okx.com/api/v5/public/funding-rate",
+                                params={"instId": inst_id}, timeout=10)
+            data = r.json()
+            if data.get("code") == "0" and data.get("data"):
+                results[asset] = float(data["data"][0]["fundingRate"])
+                print(f"    [okx] funding {asset}: {results[asset]:+.5f}")
+        except Exception as e:
+            print(f"    [okx] funding {asset} failed: {e}")
     return results
 
 
 def fetch_onchain(asset):
-    """
-    Open interest change (24h) and long/short ratio from Bybit public API.
-    Returns dict: oi_change_24h, long_ratio, oi_usd
-    """
-    perp_map = {"BTC/USD": ("BTC/USDT:USDT", "BTCUSDT"),
-                "ETH/USD": ("ETH/USDT:USDT", "ETHUSDT")}
-    perp, sym = perp_map.get(asset, ("BTC/USDT:USDT", "BTCUSDT"))
+    """OI change (24h) and long/short ratio from OKX public API."""
+    okx_map = {"BTC/USD": ("BTC-USDT-SWAP", "BTC"),
+               "ETH/USD": ("ETH-USDT-SWAP", "ETH")}
+    inst_id, ccy = okx_map.get(asset, ("BTC-USDT-SWAP", "BTC"))
     out = {"oi_change_24h": 0.0, "long_ratio": 0.5, "oi_usd": 0.0}
 
+    # OI history (25 hourly points = ~24h change)
     try:
-        bybit   = ccxt.bybit({"enableRateLimit": True})
-        oi_hist = bybit.fetch_open_interest_history(perp, "1h", limit=25)
-        if len(oi_hist) >= 2:
-            oi_now = float(oi_hist[-1].get("openInterestAmount", 0))
-            oi_24h = float(oi_hist[0].get("openInterestAmount", oi_now))
+        r    = requests.get(
+            "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume",
+            params={"ccy": ccy, "period": "1H", "limit": "25"}, timeout=10)
+        data = r.json()
+        if data.get("code") == "0" and len(data.get("data", [])) >= 2:
+            oi_now = float(data["data"][0][1])   # newest first
+            oi_24h = float(data["data"][-1][1])
             out["oi_usd"]        = oi_now
             out["oi_change_24h"] = (oi_now / oi_24h - 1) if oi_24h > 0 else 0
-    except Exception:
-        pass
+            print(f"    [okx] OI {asset}: {out['oi_change_24h']:+.2%} 24h")
+    except Exception as e:
+        print(f"    [okx] OI {asset} failed: {e}")
 
+    # Long/short account ratio
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/account-ratio",
-                            params={"category": "linear", "symbol": sym,
-                                    "period": "1h", "limit": 1}, timeout=10)
+        r    = requests.get(
+            "https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio",
+            params={"ccy": ccy, "period": "1H", "limit": "1"}, timeout=10)
         data = r.json()
-        if data.get("retCode") == 0:
-            lst = data["result"]["list"]
-            if lst:
-                out["long_ratio"] = float(lst[0]["buyRatio"])
-    except Exception:
-        pass
+        if data.get("code") == "0" and data.get("data"):
+            ratio = float(data["data"][0][1])    # longs/shorts ratio
+            out["long_ratio"] = ratio / (1 + ratio)
+            print(f"    [okx] L/S {asset}: {out['long_ratio']:.0%} long")
+    except Exception as e:
+        print(f"    [okx] L/S {asset} failed: {e}")
 
     return out
 
@@ -225,18 +224,23 @@ def fetch_macro():
 
 
 def fetch_orderbook(asset):
-    """Bybit perp order book — top-25 bid/ask volume imbalance."""
-    perp_map = {"BTC/USD": "BTC/USDT:USDT", "ETH/USD": "ETH/USDT:USDT"}
-    perp = perp_map.get(asset, "BTC/USDT:USDT")
+    """Kraken spot order book — same exchange as candles, reliable from CI."""
+    kraken_map = {"BTC/USD": "XBTUSD", "ETH/USD": "ETHUSD"}
+    pair = kraken_map.get(asset, "XBTUSD")
     try:
-        bybit = ccxt.bybit({"enableRateLimit": True})
-        ob    = bybit.fetch_order_book(perp, limit=25)
-        bid   = sum(b[1] for b in ob["bids"])
-        ask   = sum(a[1] for a in ob["asks"])
-        imb   = bid / (bid + ask) if (bid + ask) > 0 else 0.5
-        return {"imbalance": imb, "bid_vol": bid, "ask_vol": ask}
-    except Exception:
-        return {"imbalance": 0.5, "bid_vol": 0, "ask_vol": 0}
+        r    = requests.get("https://api.kraken.com/0/public/Depth",
+                            params={"pair": pair, "count": 25}, timeout=10)
+        data = r.json()
+        if not data.get("error"):
+            book = list(data["result"].values())[0]
+            bid  = sum(float(b[1]) for b in book["bids"])
+            ask  = sum(float(a[1]) for a in book["asks"])
+            imb  = bid / (bid + ask) if (bid + ask) > 0 else 0.5
+            print(f"    [kraken] book {asset}: {imb:.0%} bid")
+            return {"imbalance": imb, "bid_vol": bid, "ask_vol": ask}
+    except Exception as e:
+        print(f"    [kraken] book {asset} failed: {e}")
+    return {"imbalance": 0.5, "bid_vol": 0, "ask_vol": 0}
 
 
 # ── 7-Agent independent council ────────────────────────────────────────────────
